@@ -92,16 +92,19 @@ def bot(renderer: ArenaRenderer):
     last_turn     = -1
     last_request  = 0.0
 
-    grid_cache    = []                        # готовые узлы решётки
-    next_radius   = 0                         # какой слой добавить далее
-
-    while True:
-        # ---- RPS-ограничитель ----
+    def throttle():
+        """Sleep so that both GET and POST stay within MAX_RPS."""
+        nonlocal last_request
         now = time.time()
         if now - last_request < STEP_DELAY:
             time.sleep(STEP_DELAY - (now - last_request))
         last_request = time.time()
 
+    grid_cache    = []                        # готовые узлы решётки
+    next_radius   = 0                         # какой слой добавить далее
+
+    while True:
+        throttle()
         arena = requests.get(URL + "/api/arena", headers=H).json()
         renderer.set_state(arena)
 
@@ -124,7 +127,9 @@ def bot(renderer: ArenaRenderer):
                      for (q, r), t in known.items()}
 
         spot      = (arena["spot"]["q"], arena["spot"]["r"])
-        helpers   = [(h["q"], h["r"]) for h in arena["home"] if (h["q"], h["r"]) != spot]
+        helpers   = [(h["q"], h["r"]) for h in arena["home"]]
+        if not helpers:
+            helpers = [spot]
         resources = [(f["q"], f["r"]) for f in arena["food"]]
 
         # ---- расширяем кэш узлов, если нужно ----
@@ -197,6 +202,7 @@ def bot(renderer: ArenaRenderer):
                           "path": [{"q": step[0], "r": step[1]}]})
 
         # ---- единый POST на ход ----
+        throttle()
         requests.post(URL + "/api/move", headers=H, json={"moves": moves})
 
 # ───────── визуализация ────────────────────────────────────────────────────
