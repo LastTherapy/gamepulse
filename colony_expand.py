@@ -1,235 +1,176 @@
 #!/usr/bin/env python3
-# colony_expand.py
-# ─────────────────────────────────────────────────────────────────────────────
-# • Рабочие появляются на spot с вероятностью 60 % / тик (до 50 шт).
-# • Заполняют квадратную сетку, которая **автоматически расширяется**:
-#       сначала 4 × 4, затем 6 × 6, 8 × 8 …
-# • Несут ресурсы → выгружают строго на вспомогательные гексы (не на spot).
-# • Кислоту стараются обходить (penalty = 5), но она проходима (1 ОП).
-# • Ресурсы спавнятся реже (0.05) и максимум 30.
-# • Цвета:  spot — фиолетовый, home helpers — жёлтые кольца.
-# ----------------------------------------------------------------------------
+# bot_with_viewer.py  –  «один шаг – один расчёт»
 
-import math, random, time, sys, pygame
-from typing import Dict, Tuple, List, Set, Optional
+import threading, time, random, sys, json, requests, pygame, heapq
+from datspulse_viewer import ArenaRenderer
+from collections import defaultdict
 
-# ───── параметры ───────────────────────────────────────────────────────────
-HEX_SIZE          = 26
-GRID_W, GRID_H    = 20, 20
-FPS               = 60
-TICK_SEC          = 1.0
-WORKER_PROB       = 0.60       # шанс появления рабочего / тик
-MAX_WORKERS       = 50
-WORKER_SPEED      = 4
+URL   = "https://games-test.datsteam.dev"
+TOKEN = "39413815-04e3-4ba6-b21e-ad5c29ca2cee"
+H     = {"accept":"application/json","X-Auth-Token":TOKEN}
 
-SPAWN_CHANCE      = 0.05       # ресурсы
-MAX_RES           = 30
+TICK_SEC   = 2.0          # не дергаем API чаще, чем раз в 2 c
+ACID_PEN   = 5
+SCOUT_STEP = 4
 
-TERRAIN = {                     # name,        rgb,       move, pen
-    2: ("empty", (170,170,170), 1, 0),
-    3: ("dirt",  (139, 84, 33), 2, 0),
-    4: ("acid",  ( 20,170,230), 1, 5),
-    5: ("stone", ( 60, 60, 60), None, None),
-}
+status_text = "‣ waiting registration…"
 
-RES_CLR   = (255,215,0)
-WORK_CLR  = (255,140,0)
-PATH_CLR  = (220,40,40)
-SPOT_CLR  = (180, 60,250)      # фиолетовый
-HELP_CLR  = (255,255,  0)      # жёлтый
-BG, GRID  = (25,25,25), (60,60,60)
-SQRT3     = math.sqrt(3)
-
-# ───── геометрия ───────────────────────────────────────────────────────────
-DIRS = [(+1,0),(+1,-1),(0,-1),(-1,0),(-1,+1),(0,+1)]
-def axial_px(q,r,s=HEX_SIZE): return s*1.5*q, s*SQRT3*(r+q/2)
-def hex_pts(cx,cy,s=HEX_SIZE):
-    return [(round(cx+s*math.cos(math.radians(a))),
-             round(cy+s*math.sin(math.radians(a))))
-            for a in range(0,360,60)]
+# ───────── геометрия ──────────────────────────────────────────────────────
+DIRS=[(+1,0),(+1,-1),(0,-1),(-1,0),(-1,+1)]
 def hex_dist(a,b):
     aq,ar=a; bq,br=b
     return max(abs(aq-bq),abs(ar-br),abs((aq+ar)-(bq+br)))
 
-# ───── A* ──────────────────────────────────────────────────────────────────
-def a_star(start,goal,move_cost,penalty):
-    if move_cost.get(goal) is None: return None
-    open_l=[(hex_dist(start,goal),0,start)]
+def a_star(start,goal,move_cost,penalty,blocked):
+    """A* с учётом непроходимых blocked (занятые сейчас клетки)."""
+    if move_cost.get(goal) is None or goal in blocked:   # до цели физически нельзя
+        return None
+    open_q=[(hex_dist(start,goal),0,start)]
     best={start:0}; came={}
-    while open_l:
-        open_l.sort(key=lambda x:x[0])
-        _, gp, cur=open_l.pop(0)
+    while open_q:
+        open_q.sort(key=lambda x:x[0])
+        _, g, cur=open_q.pop(0)
         if cur==goal:
             path=[cur]
             while cur in came: cur=came[cur]; path.append(cur)
             return path[::-1]
         for dq,dr in DIRS:
             nxt=(cur[0]+dq,cur[1]+dr)
-            mv=move_cost.get(nxt)
-            if mv is None: continue
-            g2=gp+mv+penalty.get(nxt,0)
+            if nxt in blocked and nxt!=goal:    # чужой муравей / своя цель
+                continue
+            mc=move_cost.get(nxt)
+            if mc is None: continue
+            g2=g+mc+penalty.get(nxt,0)
             if g2<best.get(nxt,1e9):
                 best[nxt]=g2; came[nxt]=cur
-                f=g2+hex_dist(nxt,goal)
-                open_l.append((f,gp+mv,nxt))
+                heapq.heappush(open_q,(g2+hex_dist(nxt,goal),g2,nxt))
     return None
 
-# ───── генерация карты ─────────────────────────────────────────────────────
-def make_map():
-    mp={}
-    for q in range(GRID_W):
-        for r in range(GRID_H):
-            mp[(q,r)] = random.choices([2,3,4,5],[70,15,10,5])[0]
-    return mp
+# ───────── регистрация ────────────────────────────────────────────────────
+def wait_register():
+    global status_text
+    deadline=time.time()+5*60
+    while time.time()<deadline:
+        r=requests.post(URL+"/api/register",headers=H)
+        if r.status_code==200:
+            status_text="✓ registered, waiting start…"
+            return True
+        status_text=f"register {r.status_code}: {r.text.strip()}"
+        time.sleep(5)
+    status_text="⨯ registration window closed"; return False
 
-# ───── утилиты ─────────────────────────────────────────────────────────────
-def random_free(world, taken:Set):
+# ───────── бот ────────────────────────────────────────────────────────────
+def bot(renderer:ArenaRenderer):
+    global status_text
+    if not wait_register(): sys.exit(1)
+
+    known={},                  # типы клеток
+    scout_grid=[]
+    last_move=0
+
     while True:
-        p=(random.randrange(GRID_W), random.randrange(GRID_H))
-        if world[p]!=5 and p not in taken: return p
+        arena=requests.get(URL+"/api/arena",headers=H).json()
+        renderer.set_state(arena)
 
-def draw_hex(screen, color, cx, cy):
-    pygame.draw.polygon(screen,color,hex_pts(cx,cy))
-    pygame.draw.polygon(screen,GRID,hex_pts(cx,cy),1)
+        # до старта
+        if not arena.get("map"):
+            status_text=json.dumps(arena,indent=2,ensure_ascii=False)
+            time.sleep(2); continue
 
-# ───── main ────────────────────────────────────────────────────────────────
+        status_text=f"turn {arena['turnNo']:>4}  ants:{len(arena['ants'])}  food:{len(arena['food'])}"
+
+        # --- карта
+        for c in arena["map"]:
+            known[c["q"],c["r"]]=c["type"]
+
+        move_cost={(q,r):(2 if t==3 else 1) if t!=5 else None
+                   for (q,r),t in known.items()}
+        penalty  ={(q,r):ACID_PEN if t==4 else 0
+                   for (q,r),t in known.items()}
+
+        # --- вспомогательные наборы
+        spot=(arena["spot"]["q"],arena["spot"]["r"])
+        helpers=[(h["q"],h["r"]) for h in arena["home"]
+                 if (h["q"],h["r"])!=spot]
+        resources=[(f["q"],f["r"]) for f in arena["food"]]
+
+        if not scout_grid:                      # однажды строим точки обзора
+            rng=range(-SCOUT_STEP*4,SCOUT_STEP*4+1)
+            for dq in rng:
+                for dr in rng:
+                    if dq%SCOUT_STEP==dr%SCOUT_STEP==0:
+                        cell=(spot[0]+dq, spot[1]+dr)
+                        if known.get(cell,5)!=5:
+                            scout_grid.append(cell)
+
+        # --- пауза, чтобы не спамить
+        if time.time()-last_move < TICK_SEC:
+            time.sleep(0.2); continue
+        last_move=time.time()
+
+        occupied={(a["q"],a["r"]) for a in arena["ants"]}
+
+        # шаги, выбранные прямо сейчас (чтобы два не лезли в одно)
+        reservation=set()
+        decisions=[]      # (ant_id, step_qr)
+
+        for ant in arena["ants"]:
+            aid=ant["id"]
+            pos=(ant["q"],ant["r"])
+            typ=ant["type"]
+            carrying=ant["food"]["amount"]>0
+
+            # --- выбор цели
+            if typ==2:                        # разведчики
+                target=min(scout_grid, key=lambda c:hex_dist(pos,c))
+            elif carrying:
+                target=min(helpers, key=lambda h:hex_dist(pos,h))
+            elif resources:
+                target=min(resources, key=lambda r:hex_dist(pos,r))
+            else:
+                dq,dr=random.choice(DIRS); target=(pos[0]+dq,pos[1]+dr)
+
+            # --- ищем путь А* (понимая, что occupied – стены на этот тик)
+            path=a_star(pos, target, move_cost, penalty, occupied)
+            if not path or len(path)==1:      # стоим
+                step=pos
+            else:
+                step=path[1]
+
+            # если уже кто-то зарезервировал эту клетку – уступаем (стоим)
+            if step in reservation:
+                step=pos
+            reservation.add(step)
+            decisions.append((aid, step))
+
+        # --- формируем JSON move
+        moves=[{"ant":aid,"path":[{"q":q,"r":r}]} for aid,(q,r) in decisions]
+        requests.post(URL+"/api/move",headers=H,json={"moves":moves})
+
+# ───────── окно ────────────────────────────────────────────────────────────
 def main():
+    global status_text
     pygame.init()
-    screen=pygame.display.set_mode((1200,900), pygame.RESIZABLE)
-    pygame.display.set_caption("Expanding grid colony")
-
-    world = make_map()
-    move_cost={pos:TERRAIN[t][2] for pos,t in world.items()}
-    penalty  ={pos:TERRAIN[t][3] for pos,t in world.items()}
-
-    spot=(GRID_W//2, GRID_H//2)          # центр
-    helpers=[(spot[0]-1,spot[1]), (spot[0],spot[1]-1)]
-    workers=[]                           # [{'pos', 'carrying', 'path', 'target'}]
-    resources:Set=set()
-
-    grid_radius=2                        # половина текущего квадрата (4×4)
-
-    offset=[150,150]; drag=False; m0=o0=(0,0)
-    clock=pygame.time.Clock(); last_tick=time.time()
+    screen=pygame.display.set_mode((1280,800),pygame.RESIZABLE)
+    pygame.display.set_caption("Datspulse bot – single-step planner")
+    renderer=ArenaRenderer(screen)
     font=pygame.font.SysFont("consolas",14)
 
-    # ── функции ------------------------------------------------------------
-    def center(q,r): x,y=axial_px(q,r); return round(x+offset[0]),round(y+offset[1])
+    threading.Thread(target=bot,args=(renderer,),daemon=True).start()
 
-    def spawn_resource():
-        if len(resources)>=MAX_RES: return
-        for (q,r),t in world.items():
-            if t==5 or (q,r) in resources: continue
-            if random.random()<SPAWN_CHANCE and (q,r) not in {w['pos'] for w in workers}:
-                resources.add((q,r))
-
-    def spawn_worker():
-        if len(workers)>=MAX_WORKERS: return
-        if random.random()<=WORKER_PROB:
-            workers.append({"pos":spot,"carrying":False,"path":[],"target":None})
-
-    def grid_cells(radius):
-        for dq in range(-radius,radius):
-            for dr in range(-radius,radius):
-                yield (spot[0]+dq, spot[1]+dr)
-
-    def choose_grid_target():
-        taken={tuple(w['target']) for w in workers if w['target'] and not w['carrying']}
-        for cell in grid_cells(grid_radius):
-            if world.get(cell,5)==5: continue
-            if cell in taken: continue
-            return cell
-        return None
-
-    def expand_grid_if_needed():
-        nonlocal grid_radius
-        needed=sum(1 for cell in grid_cells(grid_radius) if world.get(cell,5)!=5)
-        assigned=sum(1 for w in workers if w['target'] and not w['carrying'] and w['target'] in grid_cells(grid_radius))
-        if assigned>=needed:
-            grid_radius+=1
-
-    def plan(w, goal):
-        path=a_star(w['pos'], goal, move_cost, penalty)
-        w['path']=path[1:] if path else []
-        w['target']=goal
-
-    # ── начальный рес -------------------------------------------------------
-    spawn_resource()
-
-    # ── цикл ----------------------------------------------------------------
-    running=True
+    clock=pygame.time.Clock(); running=True
     while running:
         for e in pygame.event.get():
             if e.type==pygame.QUIT or (e.type==pygame.KEYDOWN and e.key==pygame.K_ESCAPE):
                 running=False
-            elif e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
-                drag=True; m0=e.pos; o0=tuple(offset)
-            elif e.type==pygame.MOUSEBUTTONUP and e.button==1:
-                drag=False
-            elif e.type==pygame.MOUSEMOTION and drag:
-                dx,dy=e.pos[0]-m0[0], e.pos[1]-m0[1]; offset=[o0[0]+dx,o0[1]+dy]
+            renderer.handle_event(e)
 
-        if time.time()-last_tick>=TICK_SEC:
-            last_tick=time.time()
-            spawn_resource(); spawn_worker()
-
-            for w in workers:
-                speed=WORKER_SPEED
-                while speed>0 and w['path']:
-                    nxt=w['path'][0]; mv=move_cost[nxt]
-                    if mv is None or mv>speed: break
-                    w['pos']=nxt; w['path'].pop(0); speed-=mv
-
-                if not w['path']:
-                    if w['carrying'] and w['pos'] in helpers:
-                        w['carrying']=False
-                    elif (not w['carrying']) and w['pos'] in resources:
-                        resources.remove(w['pos']); w['carrying']=True
-
-                    if w['carrying']:
-                        plan(w, random.choice(helpers))
-                    elif resources:
-                        nearest=min(resources, key=lambda p:hex_dist(w['pos'],p))
-                        plan(w, nearest)
-                    else:
-                        tgt=choose_grid_target()
-                        if tgt: plan(w,tgt)
-
-            expand_grid_if_needed()
-
-        # ─── отрисовка —────────────────────────────────────────────────────
-        screen.fill(BG)
-        for (q,r),t in world.items():
-            draw_hex(screen,TERRAIN[t][1],*center(q,r))
-
-        # дом
-        pygame.draw.circle(screen, SPOT_CLR, center(*spot), HEX_SIZE//2,3)
-        for h in helpers:
-            pygame.draw.circle(screen, HELP_CLR, center(*h), HEX_SIZE//2,2)
-
-        # ресурсы
-        for rq,rr in resources: pygame.draw.circle(screen, RES_CLR, center(rq,rr), HEX_SIZE//3)
-
-        # пути
-        for w in workers:
-            if w['path']:
-                pts=[center(*w['pos'])]+[center(q,r) for q,r in w['path']]
-                pygame.draw.lines(screen, PATH_CLR, False, pts, 3)
-
-        # рабочие
-        for w in workers:
-            cx,cy=center(*w['pos'])
-            pygame.draw.circle(screen, WORK_CLR, (cx,cy), HEX_SIZE//2)
-            if w['carrying']:
-                pygame.draw.circle(screen, RES_CLR, (cx+HEX_SIZE//2-6, cy-HEX_SIZE//2+6),6)
-
-        hud=font.render(f"W={len(workers)} R={len(resources)} Grid={grid_radius*2}×{grid_radius*2}",True,(220,220,220))
-        screen.blit(hud,(10,10))
-
-        pygame.display.flip()
-        clock.tick(FPS)
-
-    pygame.quit(); sys.exit()
+        renderer.draw()
+        y=10
+        for line in status_text.splitlines():
+            screen.blit(font.render(line,True,(255,255,0)),(10,y)); y+=16
+        pygame.display.flip(); clock.tick(60)
+    pygame.quit()
 
 if __name__=="__main__":
     main()
