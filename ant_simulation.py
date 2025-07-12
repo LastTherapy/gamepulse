@@ -127,6 +127,9 @@ def generate_slots(base_coord:Tuple[int,int], home_hexes:List[Tuple[int,int]], k
 # Ant types
 # ---------------------------------------------------------------------------
 class WorkerAnt(Ant):
+    def __init__(self, ant_id:int, pos:Tuple[int,int]):
+        super().__init__(ant_id, 'worker', pos)
+
     SEARCH_INTERVAL=5
 
     def update(self, tick:int, move_cost, penalty, foods:Set[Tuple[int,int]], home_hexes:List[Tuple[int,int]]):
@@ -172,6 +175,9 @@ class WorkerAnt(Ant):
         self._station=val
 
 class ScoutAnt(Ant):
+    def __init__(self, ant_id:int, pos:Tuple[int,int]):
+        super().__init__(ant_id, 'scout', pos)
+
     def update(self, move_cost, penalty, foods:Set[Tuple[int,int]], home_hexes:List[Tuple[int,int]]):
         if self.state=='to_station' and self.pos==self.target:
             self.state='sentry'
